@@ -6,15 +6,15 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 # --- Configuration ---
-
 load_dotenv()
+
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
-    raise ValueError("API Key not found! Please create a GOOGLE_API_KEY.")
+    raise ValueError("API Key not found! Please check your .env file.")
 
 client = genai.Client(api_key=api_key)
 
-MODEL_NAME = "gemini-2.5-pro"
+MODEL_NAME = "gemini-2.0-flash"
 
 WEIGHTS = {
     "syntax": 15,
@@ -87,37 +87,35 @@ class AIEvaluator:
     def synthesize_final_report(self, individual_reports: List[Dict[str, Any]], overall_score: float) -> Dict[str, Any]:
         summary_context = ""
         for i, rep in enumerate(individual_reports):
+            tech = rep['ai_analysis'].get('technical_analysis', {})
             summary_context += f"""
-            [Question {i+1}]: {rep['question']} ({rep['language']})
-            - Score: {rep['final_score']}/100
-            - Metrics: {rep['metrics']['pass_rate']}% Pass Rate
-            - AI Critique: {rep['ai_analysis'].get('technical_analysis', {}).get('critique')}
+            Q{i+1}: {rep['question']} ({rep['language']})
+            - Score: {rep['final_score']}
+            - Pass Rate: {rep['metrics']['pass_rate']}%
+            - Efficiency: {tech.get('efficiency_score', 'N/A')}
+            - Critique: {tech.get('critique', 'N/A')}
             """
 
         prompt = f"""
-        You are the Hiring Manager. Review this candidate's full technical assessment.
-        
-        ### OVERALL SCORE: {overall_score} / 100
-        
-        ### PERFORMANCE DETAILS
+        You are the Hiring Manager. Write a final decision based on these metrics.
+
+        ### CANDIDATE DATA
+        Overall Score: {overall_score}/100
         {summary_context}
 
-        ### YOUR TASK
-        Generate the Final Decision Report.
-        1. **Recruiter Decision:** Do we hire? (Base this on code quality, not just pass rate).
-        2. **Candidate Growth:** What is the ONE main theme they need to improve?
+        ### TASK
+        Return strict JSON (no markdown).
 
-        ### OUTPUT FORMAT (Strict JSON)
         {{
-            "recruiter_summary": {{
-                "hiring_decision": "Strong Hire" OR "Hire" OR "Weak Hire" OR "No Hire",
-                "candidate_level_assessment": "Junior" OR "Mid-Level" OR "Senior",
-                "final_conclusion": "Professional summary justifying the decision."
+            "recruiter_executive_summary": {{
+                "hiring_decision": "Strong Hire/Hire/Weak Hire/No Hire",
+                "candidate_level_assessment": "Junior/Mid-Level/Senior",
+                "final_conclusion": "2 sentences justifying the decision."
             }},
-            "candidate_feedback": {{
-                "major_strength": "string",
-                "major_weakness": "string",
-                "final_recommendation": "Constructive advice for their career growth."
+            "candidate_holistic_feedback": {{
+                "major_strength": "The one thing they did best.",
+                "major_weakness": "The one thing they must fix.",
+                "final_recommendation": "One specific topic to study."
             }}
         }}
         """
@@ -125,22 +123,35 @@ class AIEvaluator:
 
     def _call_ai(self, prompt: str) -> Dict[str, Any]:
         try:
-            response = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+            # FIX: Using a simple dictionary for config avoids the 'AttributeError'
+            # associated with the GenerationConfig object in some SDK versions.
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt,
+                config={
+                    'response_mime_type': 'application/json'
+                }
+            )
+            
             raw = response.text.strip()
             
+            # Robust Regex to find JSON content inside code blocks or plain text
             match = re.search(r"```(?:json)?\s*(.*)\s*```", raw, re.DOTALL)
-            if match: raw = match.group(1)
+            if match: 
+                raw = match.group(1)
             
             return json.loads(raw)
+
         except Exception as e:
-            return self._get_fallback_error(str(e))
+            print(f"AI GENERATION ERROR: {e}")
+            return {}
 
     def _get_fallback_error(self, message):
         return {
             "technical_analysis": {"efficiency_score": 5, "style_score": 5, "critique": "AI Error"},
             "feedback_for_candidate": {"what_went_well": "N/A", "what_to_improve": f"Error: {message}"},
-            "recruiter_summary": {"hiring_decision": "Undetermined", "final_conclusion": "AI Service Unavailable"},
-            "candidate_feedback": {"major_strength": "N/A", "major_weakness": "N/A"}
+            "recruiter_executive_summary": {"hiring_decision": "Undetermined", "final_conclusion": "AI Service Unavailable"},
+            "candidate_holistic_feedback": {"major_strength": "N/A", "major_weakness": "N/A"}
         }
 
     def score(self, quant: Dict[str, Any], qual: Dict[str, Any], syntax_error: bool) -> float:
@@ -185,7 +196,7 @@ class ReportGenerator:
         # 3. Generate Executive Summary
         final_summary = self.evaluator.synthesize_final_report(reports, overall_avg)
 
-        # 4. Final Structure: Detailed Analysis First, then Conclusion
+        # 4. Final Structure
         return {
             "detailed_question_analysis": reports,
             "final_conclusive_report": {
